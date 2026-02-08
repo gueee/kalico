@@ -67,6 +67,7 @@ class DynamicChopper:
         self.fields = None
         self.zone_registers = []
         self.reversal_registers = {}
+        self.reversal_irun_regs = None
         # Events
         self.printer.register_event_handler(
             'klippy:connect', self._handle_connect)
@@ -88,6 +89,7 @@ class DynamicChopper:
         self.mcu_tmc = tmc_obj.mcu_tmc
         self.fields = self.mcu_tmc.get_fields()
         self._precompute_registers()
+        self._precompute_reversal_current()
         self._hook_move_pipeline()
         logging.info("DCC: initialized %s — %d velocity zones, "
                      "boundaries at %s mm/s",
@@ -111,6 +113,29 @@ class DynamicChopper:
                 self._build_reg_dict(base, overrides))
         self.reversal_registers = self._build_reg_dict(
             base, self._reversal_overrides)
+
+    def _precompute_reversal_current(self):
+        """Pre-compute IHOLD_IRUN register value with scaled irun for
+        reversal current reduction. Also stores the normal value for
+        restoration after reversal.
+        """
+        if self.reversal_current_scale is None:
+            return
+        base_ihold_irun = self.fields.registers.get('IHOLD_IRUN', 0)
+        irun_mask = self.fields.all_fields['IHOLD_IRUN']['irun']
+        irun = (base_ihold_irun & irun_mask) >> tmc.ffs(irun_mask)
+        scaled_irun = int(irun * self.reversal_current_scale)
+        scaled_irun = max(0, min(31, scaled_irun))
+        rev_val = (base_ihold_irun & ~irun_mask) | (
+            (scaled_irun << tmc.ffs(irun_mask)) & irun_mask)
+        self.reversal_irun_regs = {
+            'IHOLD_IRUN': rev_val,
+        }
+        self._normal_ihold_irun = base_ihold_irun
+        logging.info("DCC %s: reversal current scale %.2f — "
+                     "irun %d → %d",
+                     self.stepper_name, self.reversal_current_scale,
+                     irun, scaled_irun)
 
     def _build_reg_dict(self, base_regs, field_overrides):
         """Return {reg_name: value} with field_overrides applied on top."""
@@ -234,22 +259,27 @@ class DynamicChopper:
         move_start = next_move_time - duration
         is_rev = self._is_reversal(move)
         # --- Reversal handling ---
-        if is_rev and self.reversal_registers:
-            self._write_registers(
-                self.reversal_registers,
-                move_start - self.reversal_lead_time)
+        if is_rev and (self.reversal_registers or self.reversal_irun_regs):
+            rev_time = move_start - self.reversal_lead_time
+            if self.reversal_registers:
+                self._write_registers(self.reversal_registers, rev_time)
+            if self.reversal_irun_regs:
+                self._write_registers(self.reversal_irun_regs, rev_time)
             self.in_reversal = True
             self.current_zone = -1
             logging.debug("DCC %s: reversal at t=%.6f",
                           self.stepper_name, move_start)
         if self.in_reversal:
-            # End reversal: restore zone profile after hold time
+            # End reversal: restore zone profile + normal current
             rev_end = move_start + self.reversal_hold_time
             zone = self._velocity_to_zone(move.start_v)
             regs = self.zone_registers[zone]
             if regs:
                 self._write_registers(regs, rev_end)
                 self.current_zone = zone
+            if self.reversal_irun_regs:
+                self._write_registers(
+                    {'IHOLD_IRUN': self._normal_ihold_irun}, rev_end)
             self.in_reversal = False
         # --- Zone crossings within the move ---
         crossings = self._find_zone_crossings(move, move_start)
